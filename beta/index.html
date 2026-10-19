@@ -1,1 +1,202 @@
+<!doctype html><html lang="de"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Plattenzuschnitt – exakter Mehrplattentest</title><style>body{font:15px system-ui,sans-serif;max-width:1050px;margin:30px auto;padding:0 15px;color:#223047;background:#f3f6fb}section{background:white;padding:18px;border:1px solid #dbe3ed;border-radius:12px;margin:14px 0}h1{font-size:25px}textarea{width:100%;height:290px;font:13px ui-monospace,monospace;box-sizing:border-box}button{background:#2563eb;color:white;padding:12px 18px;border:0;border-radius:8px;cursor:pointer}button:disabled{opacity:.5}pre{white-space:pre-wrap;overflow-wrap:anywhere}svg{background:#eef2f7;border:1px solid #94a3b8;max-width:100%}.board{padding:12px;border-top:1px solid #e2e8f0}label{margin-right:15px}small{color:#53637b}</style><h1>Plattenzuschnitt – Mehrplatten-Testversion</h1><p>Exakte Suche für maximal 15 Einzelteile. Nur <strong>optimal</strong> bedeutet mathematisch nachgewiesen optimal; <strong>feasible</strong> ist ein gültiger, aber nicht als optimal bewiesener Plan.</p><section><label><input type="checkbox" id="prefer"> Reststücke bevorzugen (minimiert neue Rohplatten zuerst)</label><label>Zeitlimit <input id="seconds" type="number" min="1" max="3600" value="600" style="width:60px"> Sekunden</label><p><small>Abmessungen in ganzen Millimetern. <code>rot</code> erlaubt 90°-Drehung. <code>q</code> ist die Stückzahl. <code>mode</code> ist <code>limited</code> oder <code>unlimited</code>.</small></p><textarea id="input" spellcheck="false"></textarea><p><button id="run">Berechnen</button> <button id="stop" disabled>Abbrechen</button></p><p id="status"></p></section><section><h2>Ergebnis und Schnittpläne</h2><div id="out"></div></section><script id="worker-source" type="text/plain">
+/* Exact slicing-tree feasibility solver, integer millimetres, one rectangular stock.
+   Complete only if result.status is 'impossible' or 'solved'. Budget exhaustion = 'unknown'.
+   Guillotine cuts are represented as binary joins; all joints incur kerf + safety.
+   Each subset retains Pareto-minimal bounding boxes, sufficient for feasibility.
+*/
+(function(root){
+'use strict';
+function solve(input, opts={}) {
+ const t0=Date.now(), maxMs=opts.maxMs??60000, maxStates=opts.maxStates??800000, maxOps=opts.maxOps??250000000;
+ const pieces=[];
+ for(const p of input.parts||[])for(let i=0;i<(p.q??1);i++)pieces.push({id:p.id,w:+p.w,h:+p.h,rot:!!p.rot});
+ const n=pieces.length, stocks=[...(input.stocks||[]).filter(s=>s.mode!=='limited'||s.qty>0),...(input.rests||[]).filter(s=>(s.q??s.qty??1)>0)];
+ if(!n||n>15||!stocks.length)return {status:'unsupported',reason:'Benötigt 1–15 Einzelteile und mindestens eine verfügbare Platte'};
+ if(pieces.some(p=>!Number.isInteger(p.w)||!Number.isInteger(p.h)||p.w<=0||p.h<=0))return {status:'unsupported',reason:'Ungültige Teileabmessungen'};
+ if(stocks.some(s=>!Number.isInteger(s.w)||!Number.isInteger(s.h)||s.w<=0||s.h<=0))return {status:'unsupported',reason:'Ungültige Plattenabmessungen'};
+ const k=+(input.kerf??0)+ +(input.safety??0);
+ if(!Number.isInteger(k)||k<0)return {status:'unsupported',reason:'Ungültige Schnittzugabe'};
+ let ops=0,states=0,exhausted=false;
+ const N=1<<n, dp=new Array(N), maxW=Math.max(...stocks.map(s=>s.w)),maxH=Math.max(...stocks.map(s=>s.h));
+ const abort=()=>{if((++ops&2047)===0 && (Date.now()-t0>maxMs || states>maxStates || ops>maxOps)){exhausted=true;return true;}return false;};
+ function add(front,c){
+   if(c.w>maxW||c.h>maxH)return;
+   for(const v of front)if(v.w<=c.w&&v.h<=c.h)return;
+   for(let i=front.length-1;i>=0;i--)if(c.w<=front[i].w&&c.h<=front[i].h){front[i]=front[front.length-1];front.pop();states--;}
+   front.push(c);states++;
+ }
+ for(let i=0;i<n;i++){
+   const p=pieces[i], a=[];
+   add(a,{w:p.w,h:p.h,type:'part',index:i});
+   if(p.rot&&p.w!==p.h)add(a,{w:p.h,h:p.w,type:'part',index:i,rotated:true});
+   dp[1<<i]=a;
+ }
+ const popcount=m=>{let c=0;while(m){m&=m-1;c++;}return c;};
+ // Enumerate by subset size so both children are ready.
+ outer:for(let size=2;size<=n;size++){
+   for(let mask=1;mask<N;mask++){
+     if(popcount(mask)!==size)continue;
+     const out=[];let low=mask&-mask;
+     for(let a=(mask-1)&mask;a;a=(a-1)&mask){
+       if(!(a&low))continue; // symmetric partitions
+       const b=mask^a, left=dp[a]||[],right=dp[b]||[];
+       for(const x of left)for(const y of right){
+         add(out,{w:x.w+y.w+k,h:Math.max(x.h,y.h),type:'v',a:x,b:y});
+         add(out,{w:Math.max(x.w,y.w),h:x.h+y.h+k,type:'h',a:x,b:y});
+         if(abort())break outer;
+       }
+     }
+     dp[mask]=out;
+     if(states>maxStates){exhausted=true;break outer;}
+   }
+ }
+ const full=dp[N-1]||[];
+ let found=null,stock=null;
+ for(const s of stocks){for(const v of full){if(v.w<=s.w&&v.h<=s.h){if(!found||s.w*s.h<stock.w*stock.h){found=v;stock=s;}}}}
+ function tree(node){if(node.type==='part')return {type:'part',id:pieces[node.index].id,index:node.index,w:node.w,h:node.h,rotated:!!node.rotated};return {type:node.type,w:node.w,h:node.h,a:tree(node.a),b:tree(node.b)};}
+ return {status:found?'solved':exhausted?'unknown':'impossible',stock:found?{w:stock.w,h:stock.h,id:stock.id}:undefined,tree:found?tree(found):undefined,stats:{n,states,ops,ms:Date.now()-t0,exhausted}};
+}
+root.GuillotineExact={solve};
+if(typeof module!=='undefined')module.exports={solve};
+})(typeof globalThis!=='undefined'?globalThis:this);
 
+/* Multi-board exact assignment, bounded enumeration for <= 15 individual pieces.
+   Each candidate subset is checked by the independent exact guillotine oracle.
+   Exhaustive optimality is claimed only when no oracle call returns unknown and no budget is exhausted.
+*/
+'use strict';
+const guillotine=GuillotineExact.solve;
+function solve(input,opts={}){
+ const start=Date.now(),limit=opts.maxMs??30000,oracleMs=opts.oracleMs??3000;
+ const parts=[];
+ for(const p of input.parts||[]){if(!Number.isInteger(p.q??1)||(p.q??1)<1)return {status:'unsupported',reason:'Invalid quantity'};for(let i=0;i<(p.q??1);i++)parts.push({...p,q:1});}
+ const n=parts.length;
+ if(!Number.isInteger(input.kerf??0)||!Number.isInteger(input.safety??0)||(input.kerf??0)<0||(input.safety??0)<0)return {status:'unsupported',reason:'Invalid kerf or safety'};
+ if(!n||n>15)return {status:'unsupported',reason:'Supports 1–15 individual parts'};
+ if(parts.some(p=>!Number.isInteger(p.w)||!Number.isInteger(p.h)||p.w<=0||p.h<=0))return {status:'unsupported',reason:'Invalid part dimensions'};
+ const preferRests=!!(opts.preferRests??input.preferRests);
+ const boards=[];
+ for(const [kind,items] of [['stock',input.stocks||[]],['rest',input.rests||[]]])for(const s of items){
+  if(!Number.isInteger(s.w)||!Number.isInteger(s.h)||s.w<=0||s.h<=0)return {status:'unsupported',reason:'Invalid board dimensions'};
+  const q=kind==='rest'?(s.q??s.qty??1):(s.mode==='limited'?(s.qty??0):n);
+  if(!Number.isInteger(q)||q<0)return {status:'unsupported',reason:'Invalid stock quantity'};
+  for(let j=0;j<Math.min(q,n);j++)boards.push({kind,id:s.id,w:s.w,h:s.h,ordinal:j});
+ }
+ if(!boards.length)return {status:'impossible',reason:'No boards'};
+ if(boards.length>240)return {status:'unsupported',reason:'Too many board instances (240)'};
+ const full=(1<<n)-1,area=parts.reduce((s,p)=>s+p.w*p.h,0);
+ const memo=new Map(),oracleCache=new Map(),impossibleSubsets=new Map();let calls=0,unknown=false,timedOut=false,monotonePrunes=0;
+ const areas=parts.map(p=>p.w*p.h);const areaMask=new Float64Array(1<<n);for(let m=1;m<(1<<n);m++){const bit=m&-m;areaMask[m]=areaMask[m^bit]+areas[31-Math.clz32(bit)];}
+ // Necessary geometric filter: each part must fit the selected board in an allowed orientation.
+ const fitsPart=(p,b)=>(p.w<=b.w&&p.h<=b.h)||(!!p.rot&&p.h<=b.w&&p.w<=b.h);
+ const fitMasks=boards.map(b=>parts.reduce((m,p,i)=>m|(fitsPart(p,b)?1<<i:0),0));
+ const keyBoard=b=>`${b.w}x${b.h}`;
+ function candidate(b,mask){
+  const key=keyBoard(b)+'|'+mask;
+  if(oracleCache.has(key))return oracleCache.get(key);
+  // Monotonicity: if a subset cannot be cut from this rectangle,
+  // adding further pieces cannot make it feasible. Only proven
+  // impossible subsets are used; timeouts never enter this cache.
+  const rejected=impossibleSubsets.get(keyBoard(b));
+  if(rejected && rejected.some(m=>(mask&m)===m)){monotonePrunes++;return false;}
+  if(Date.now()-start>limit){timedOut=true;return null;}
+  const group=parts.filter((_,i)=>mask&(1<<i));
+  if(areaMask[mask]>b.w*b.h || parts.some((p,i)=>(mask&(1<<i))&&!fitsPart(p,b))){oracleCache.set(key,false);return false;}
+  const r=guillotine({stocks:[{id:b.id,w:b.w,h:b.h,mode:'limited',qty:1}],parts:group,kerf:input.kerf,safety:input.safety},{maxMs:Math.min(oracleMs,Math.max(1,limit-(Date.now()-start))),maxOps:opts.maxOps??250000000});
+  calls++;
+  if(r.status==='unknown'){unknown=true;return null;}
+  const ans=r.status==='solved'?{tree:r.tree,stats:r.stats}:false;
+  if(r.status==='unsupported'){unknown=true;return null;}
+  oracleCache.set(key,ans);
+  if(ans===false){const dims=keyBoard(b);if(!impossibleSubsets.has(dims))impossibleSubsets.set(dims,[]);impossibleSubsets.get(dims).push(mask);}
+  return ans;
+ }
+ // Objective: optionally minimise number of new stock boards first; otherwise minimise area. Available rests and stocks both count by physical area.
+ let best=null,bestCost=Infinity,bestCount=Infinity,bestNew=Infinity;
+ const better=(cost,count,newCount)=>preferRests?(newCount<bestNew||(newCount===bestNew&&(cost<bestCost||(cost===bestCost&&count<bestCount)))):(cost<bestCost||(cost===bestCost&&count<bestCount));
+ function dfs(remaining,used,selected,cost,newCount){
+  if(Date.now()-start>limit){timedOut=true;return;}
+  if(!remaining){if(better(cost,selected.length,newCount)){bestCost=cost;bestCount=selected.length;bestNew=newCount;best=selected.slice();}return;}
+  if(used===((1n<<BigInt(boards.length))-1n))return;
+  // Lower bounds that cannot exclude any feasible or optimal assignment.
+  let availableArea=0, unionFits=0;
+  for(let i=0;i<boards.length;i++)if(!(used&(1n<<BigInt(i)))){
+   availableArea+=boards[i].w*boards[i].h;
+   unionFits|=fitMasks[i];
+  }
+  if(areaMask[remaining]>availableArea || (remaining&~unionFits))return;
+  // Admissible global bounds: unused board area must at least cover the
+  // remaining part area. This never assumes that area implies cuttability.
+  // If new stock count already equals the incumbent, preferRests cannot
+  // improve by adding another stock board.
+  if(best){
+   if(preferRests){
+    if(newCount>bestNew)return;
+    if(newCount===bestNew && cost+areaMask[remaining]>bestCost)return;
+   }else if(cost+areaMask[remaining]>bestCost)return;
+  }
+  // At least one further board is necessary. Check its minimum possible
+  // area against the incumbent without solving any geometric subproblem.
+  let minNextArea=Infinity;
+  for(let i=0;i<boards.length;i++)if(!(used&(1n<<BigInt(i))) && (fitMasks[i]&remaining))
+   minNextArea=Math.min(minNextArea,boards[i].w*boards[i].h);
+  if(best && Number.isFinite(minNextArea)){
+   if(preferRests){
+    if(newCount===bestNew && cost+minNextArea>bestCost)return;
+   }else if(cost+minNextArea>bestCost)return;
+  }
+  const state=remaining+'|'+used;
+  const score=preferRests?[newCount,cost,selected.length]:[cost,selected.length];
+  const prev=memo.get(state);
+  if(prev && (prev[0]<score[0] || (prev[0]===score[0] && (prev[1]<score[1] || (prev[1]===score[1] && (prev[2]??0)<=(score[2]??0))))))return;
+  memo.set(state,score);
+  const pivot=remaining&-remaining;
+  for(let j=0;j<boards.length;j++){
+   if(used&(1n<<BigInt(j)))continue;
+   const b=boards[j],newCost=cost+b.w*b.h;
+   const newStockCount=newCount+(b.kind==='stock'?1:0);
+   if(preferRests){if(newStockCount>bestNew||(newStockCount===bestNew&&(newCost>bestCost||(newCost===bestCost&&selected.length+1>=bestCount))))continue;}
+   else if(newCost>bestCost||(newCost===bestCost&&selected.length+1>=bestCount))continue;
+   if(!(fitMasks[j]&pivot))continue;
+   // Skip identical board instances: first unused equivalent board is enough.
+   if(boards.slice(0,j).some((v,i)=>!(used&(1n<<BigInt(i)))&&v.w===b.w&&v.h===b.h&&v.kind===b.kind))continue;
+   for(let sub=remaining;sub;sub=(sub-1)&remaining){
+    if(!(sub&pivot)||(sub&~fitMasks[j]))continue;
+    const c=candidate(b,sub);
+    if(c)dfs(remaining^sub,used|(1n<<BigInt(j)),[...selected,{board:b,mask:sub,tree:c.tree}],newCost,newStockCount);
+    if(timedOut)return;
+   }
+  }
+ }
+ // BigInt bitmask supports multiple unlimited stock types without 32-bit overflow.
+ dfs(full,0n,[],0,0);
+ return {status:best?(unknown||timedOut?'feasible':'optimal'):(unknown||timedOut?'unknown':'impossible'),objective:best?{boardArea:bestCost,boardCount:bestCount,newStockCount:bestNew,partArea:area,preferRests}:undefined,placements:best?.map(x=>({board:x.board,partIndices:parts.map((_,i)=>i).filter(i=>x.mask&(1<<i)),tree:x.tree})),stats:{n,boards:boards.length,oracleCalls:calls,cached:oracleCache.size,monotonePrunes,ms:Date.now()-start,unknown,timedOut}};
+}
+self.MultiExact={solve};
+
+
+self.onmessage=e=>{try{const {input,opts}=e.data;self.postMessage({result:self.MultiExact.solve(input,opts)})}catch(error){self.postMessage({error:String(error.stack||error)})}};
+</script><script>
+const $=id=>document.getElementById(id);let worker;
+$('input').value=JSON.stringify({stocks:[{id:'Roh-100',w:100,h:100,mode:'limited',qty:2}],rests:[{id:'Rest-50',w:50,h:100,q:1}],parts:[{id:'A',w:50,h:100,q:2,rot:false},{id:'B',w:40,h:60,q:1,rot:true}],kerf:2,safety:1},null,2);
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function renderTree(tree,x,y,scale,shapes,cuts){if(tree.type==='part'){shapes.push(`<rect x="${x}" y="${y}" width="${tree.w}" height="${tree.h}" fill="${['#93c5fd','#86efac','#fcd34d','#fca5a5'][tree.index%4]}" stroke="#334155" stroke-width=".5"/><text x="${x+2}" y="${y+Math.min(13,tree.h/2)}" font-size="${Math.min(11,tree.h/3)}">${esc(tree.id??tree.index)}</text>`);return;}renderTree(tree.a,x,y,scale,shapes,cuts);if(tree.type==='v'){const at=x+tree.a.w;cuts.push(`<line x1="${at}" y1="${y}" x2="${at}" y2="${y+tree.h}" stroke="#dc2626" stroke-width="1" stroke-dasharray="3 2"/>`);renderTree(tree.b,x+tree.w-tree.b.w,y,scale,shapes,cuts)}else{const at=y+tree.a.h;cuts.push(`<line x1="${x}" y1="${at}" x2="${x+tree.w}" y2="${at}" stroke="#dc2626" stroke-width="1" stroke-dasharray="3 2"/>`);renderTree(tree.b,x,y+tree.h-tree.b.h,scale,shapes,cuts)}}
+function cutSteps(t,x=0,y=0,k=0,out=[],rw=t.w,rh=t.h){
+ // Each entry is a physically complete cut through the currently separated panel.
+ // The initial call supplies the FULL stock dimensions, including unused margins.
+ if(rw>t.w){out.push(`Besäumen längs: Teilplatte ${rw} × ${rh} mm, bei x=${x+t.w} mm (lokal ${t.w} mm), Schnittlänge ${rh} mm; Schnittzone ${k} mm`);rw=t.w;}
+ if(rh>t.h){out.push(`Besäumen quer: Teilplatte ${rw} × ${rh} mm, bei y=${y+t.h} mm (lokal ${t.h} mm), Schnittlänge ${rw} mm; Schnittzone ${k} mm`);rh=t.h;}
+ if(t.type==='part')return out;
+ if(t.type==='v'){
+  out.push(`Längsschnitt: Teilplatte ${rw} × ${rh} mm, bei x=${x+t.a.w} mm (lokal ${t.a.w} mm), Schnittlänge ${rh} mm; Schnittzone ${k} mm`);
+  cutSteps(t.a,x,y,k,out,t.a.w,rh);cutSteps(t.b,x+t.a.w+k,y,k,out,t.b.w,rh);
+ }else{
+  out.push(`Querschnitt: Teilplatte ${rw} × ${rh} mm, bei y=${y+t.a.h} mm (lokal ${t.a.h} mm), Schnittlänge ${rw} mm; Schnittzone ${k} mm`);
+  cutSteps(t.a,x,y,k,out,rw,t.a.h);cutSteps(t.b,x,y+t.a.h+k,k,out,rw,t.b.h);
+ }
+ return out;
+}
+function show(r,input){let o=`<p><strong>Status: ${esc(r.status)}</strong> – ${r.status==='optimal'?'Optimum unter der implementierten Zielfunktion bewiesen':r.status==='feasible'?'Gültiger Plan, Optimum nicht bewiesen':r.status==='unknown'?'Innerhalb des Zeitlimits nicht entschieden':r.status==='impossible'?'Unmöglich (nur bei vollständig abgeschlossener Suche)':'Nicht unterstützt'}</p>`;if(r.objective)o+=`<p>Verwendete Plattenfläche: ${r.objective.boardArea} mm²; Platten: ${r.objective.boardCount}; Teilefläche: ${r.objective.partArea} mm²</p>`;if(r.stats)o+=`<p><small>${esc(JSON.stringify(r.stats))}</small></p>`;(r.placements||[]).forEach((p,i)=>{let shapes=[],cuts=[];renderTree(p.tree,0,0,1,shapes,cuts);const b=p.board;o+=`<div class="board"><h3>Platte ${i+1}: ${esc(b.id||b.kind)} (${b.w} × ${b.h} mm)</h3><p>Teile-Indizes: ${p.partIndices.map(v=>v+1).join(', ')}</p><svg viewBox="0 0 ${b.w} ${b.h}" width="${Math.min(750,b.w)}" aria-label="Schnittbild"><rect width="${b.w}" height="${b.h}" fill="#e2e8f0"/>${shapes.join('')}${cuts.join('')}</svg><p><small>Rot gestrichelt: Guillotine-Schnitte. Jeder Schritt trennt die jeweilige Teilplatte vollständig.</small></p><details><summary>Schnittfolge (Baumreihenfolge)</summary><ol>${cutSteps(p.tree,0,0,(input.kerf||0)+(input.safety||0),[],b.w,b.h).map(step=>`<li>${esc(step)}</li>`).join('')}</ol><p><small>Massbezug: linke obere Ecke der jeweils abgetrennten Teilplatte. Besäumschnitte zur Vereinzelung sind in der Schnittfolge enthalten. Schnittzone = Schnittbreite plus Sicherheitszugabe.</small></p></details></div>`});$('out').innerHTML=o}
+$('run').onclick=()=>{try{const input=JSON.parse($('input').value);const maxMs=Math.min(3600000,Math.max(1000,Number($('seconds').value)*1000));const blob=new Blob([$('worker-source').textContent],{type:'application/javascript'});worker=new Worker(URL.createObjectURL(blob));$('run').disabled=true;$('stop').disabled=false;$('status').textContent='Berechnung läuft…';$('out').innerHTML='';worker.onmessage=e=>{if(e.data.error){$('status').textContent=e.data.error}else{show(e.data.result,input);$('status').textContent='Berechnung abgeschlossen.'}worker.terminate();worker=null;$('run').disabled=false;$('stop').disabled=true};worker.onerror=e=>{$('status').textContent=e.message;worker.terminate();worker=null;$('run').disabled=false;$('stop').disabled=true};worker.postMessage({input,opts:{maxMs,oracleMs:maxMs,preferRests:$('prefer').checked}})}catch(e){$('status').textContent=String(e)}};
+$('stop').onclick=()=>{if(worker)worker.terminate();worker=null;$('run').disabled=false;$('stop').disabled=true;$('status').textContent='Vom Benutzer abgebrochen – kein Optimalitätsnachweis.'};
+</script></html>
